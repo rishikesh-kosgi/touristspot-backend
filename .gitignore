@@ -1,0 +1,4 @@
+node_modules/
+tourist_app.db
+uploads/
+.env
