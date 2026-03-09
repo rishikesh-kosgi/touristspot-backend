@@ -53,11 +53,10 @@ router.get('/', optionalAuth, (req, res) => {
   }
 });
 
-// GET /api/spots/trending - Trending spots by views in last 7 days
+// GET /api/spots/trending - Trending spots by total views
 router.get('/trending', optionalAuth, (req, res) => {
   try {
-    const { country, user_lat, user_lon, limit = 10 } = req.query;
-    const sevenDaysAgo = Math.floor(Date.now() / 1000) - (7 * 24 * 60 * 60);
+    const { country, limit = 10 } = req.query;
 
     let query = `
       SELECT s.*,
@@ -66,17 +65,17 @@ router.get('/trending', optionalAuth, (req, res) => {
         (SELECT filename FROM photos WHERE spot_id = s.id AND status = 'approved'
          ORDER BY uploaded_at DESC LIMIT 1) as cover_photo
       FROM spots s
-      LEFT JOIN spot_views sv ON sv.spot_id = s.id AND sv.viewed_at >= ?
+      LEFT JOIN spot_views sv ON sv.spot_id = s.id
       WHERE s.status = 'approved'
     `;
-    const params = [sevenDaysAgo];
+    const params = [];
 
     if (country) {
       query += ` AND s.country = ?`;
       params.push(country);
     }
 
-    query += ` GROUP BY s.id ORDER BY view_count DESC LIMIT ?`;
+    query += ` GROUP BY s.id ORDER BY view_count DESC, photo_count DESC, s.created_at DESC LIMIT ?`;
     params.push(parseInt(limit));
 
     let spots = db.prepare(query).all(...params);
@@ -94,18 +93,21 @@ router.get('/trending', optionalAuth, (req, res) => {
   }
 });
 
-// GET /api/spots/nearby - Trending spots near user location
+// GET /api/spots/nearby - Spots near user location
 router.get('/nearby', optionalAuth, (req, res) => {
   try {
-    const { lat, lon, radius_km = 50, limit = 10 } = req.query;
+    const { lat, lon, radius_km = 50, limit = 30 } = req.query;
     if (!lat || !lon) {
       return res.status(400).json({ success: false, message: 'lat and lon required' });
     }
 
-    const sevenDaysAgo = Math.floor(Date.now() / 1000) - (7 * 24 * 60 * 60);
     const userLat = parseFloat(lat);
     const userLon = parseFloat(lon);
     const radiusKm = parseFloat(radius_km);
+
+    if (isNaN(userLat) || isNaN(userLon) || isNaN(radiusKm)) {
+      return res.status(400).json({ success: false, message: 'Invalid coordinates or radius' });
+    }
 
     // Get all approved spots then filter by distance
     const allSpots = db.prepare(`
@@ -115,10 +117,10 @@ router.get('/nearby', optionalAuth, (req, res) => {
         (SELECT filename FROM photos WHERE spot_id = s.id AND status = 'approved'
          ORDER BY uploaded_at DESC LIMIT 1) as cover_photo
       FROM spots s
-      LEFT JOIN spot_views sv ON sv.spot_id = s.id AND sv.viewed_at >= ?
+      LEFT JOIN spot_views sv ON sv.spot_id = s.id
       WHERE s.status = 'approved'
       GROUP BY s.id
-    `).all(sevenDaysAgo);
+    `).all();
 
     // Filter by distance using Haversine
     function getDistance(lat1, lon1, lat2, lon2) {
@@ -134,7 +136,7 @@ router.get('/nearby', optionalAuth, (req, res) => {
     let nearby = allSpots
       .map(s => ({ ...s, distance_km: getDistance(userLat, userLon, s.latitude, s.longitude) }))
       .filter(s => s.distance_km <= radiusKm)
-      .sort((a, b) => b.view_count - a.view_count)
+      .sort((a, b) => a.distance_km - b.distance_km || b.view_count - a.view_count)
       .slice(0, parseInt(limit));
 
     if (req.user) {

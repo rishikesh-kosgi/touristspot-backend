@@ -103,7 +103,7 @@ router.put('/spots/:id/remote', (req, res) => {
 
     res.json({
       success: true,
-      message: `Spot marked as ${is_remote ? 'remote (50km radius)' : 'normal (10m radius)'}`,
+      message: `Spot marked as ${is_remote ? 'remote (50km radius)' : 'normal (1000m radius)'}`,
     });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Update failed' });

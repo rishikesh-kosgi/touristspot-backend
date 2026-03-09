@@ -79,7 +79,7 @@ router.post('/verify-otp', (req, res) => {
       success: true,
       message: 'Login successful',
       token,
-      user: { id: user.id, phone: user.phone, name: user.name, is_admin: user.is_admin },
+      user: { id: user.id, phone: user.phone, name: user.name, is_admin: user.is_admin, points: user.points || 0 },
       isNewUser: !user.name,
     });
   } catch (err) {

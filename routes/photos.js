@@ -7,10 +7,11 @@ const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const { db, calculateDistance } = require('../database');
 const { authMiddleware } = require('../middleware/auth');
+const { validateImageForSpot } = require('../services/imageValidation');
 
 const MAX_PHOTOS = 10;
 const COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours
-const NORMAL_RADIUS_METRES = 30;
+const NORMAL_RADIUS_METRES = 1000;
 const REMOTE_RADIUS_METRES = 50000; // 50km
 const MIN_FLAGS = 3;
 
@@ -26,34 +27,6 @@ const upload = multer({
     else cb(new Error('Only JPEG and PNG images allowed'), false);
   },
 });
-
-async function validateImage(buffer) {
-  const metadata = await sharp(buffer).metadata();
-  if (metadata.width < 400 || metadata.height < 400) {
-    return { valid: false, reason: 'Image too small. Must be at least 400x400 pixels.' };
-  }
-  const { dominant } = await sharp(buffer)
-    .resize(50, 50)
-    .toFormat('raw')
-    .toBuffer({ resolveWithObject: true })
-    .then(async ({ data }) => {
-      const pixels = [];
-      for (let i = 0; i < data.length; i += 3) {
-        pixels.push([data[i], data[i + 1], data[i + 2]]);
-      }
-      const avgR = pixels.reduce((s, p) => s + p[0], 0) / pixels.length;
-      const avgG = pixels.reduce((s, p) => s + p[1], 0) / pixels.length;
-      const avgB = pixels.reduce((s, p) => s + p[2], 0) / pixels.length;
-      const variance = pixels.reduce((s, p) => {
-        return s + Math.pow(p[0] - avgR, 2) + Math.pow(p[1] - avgG, 2) + Math.pow(p[2] - avgB, 2);
-      }, 0) / pixels.length;
-      return { dominant: variance };
-    });
-  if (dominant < 100) {
-    return { valid: false, reason: 'Image appears blank or has no content.' };
-  }
-  return { valid: true };
-}
 
 // GET /api/photos/:spotId - Get approved photos (latest 10)
 router.get('/:spotId', (req, res) => {
@@ -120,7 +93,7 @@ router.post('/:spotId/upload', authMiddleware, upload.single('photo'), async (re
       const displayDistance = distanceMetres >= 1000
         ? `${(distanceMetres / 1000).toFixed(1)} km`
         : `${Math.round(distanceMetres)} metres`;
-      const displayAllowed = spot.is_remote ? '50 kilometres' : '30 metres';
+      const displayAllowed = spot.is_remote ? '50 kilometres' : '1000 metres';
       return res.status(403).json({
         success: false,
         message: `You are too far. You are ${displayDistance} away. Must be within ${displayAllowed}.`,
@@ -156,9 +129,14 @@ router.post('/:spotId/upload', authMiddleware, upload.single('photo'), async (re
       return res.status(400).json({ success: false, message: 'No image provided.' });
     }
 
-    const validation = await validateImage(req.file.buffer);
-    if (!validation.valid) {
-      return res.status(400).json({ success: false, message: validation.reason });
+    const validation = await validateImageForSpot(req.file.buffer);
+    if (!validation.accepted) {
+      return res.status(400).json({
+        success: false,
+        message: validation.reason,
+        failed_rule: validation.failedRule,
+        checks: validation.checks,
+      });
     }
 
     const filename = `photo_${uuidv4()}.jpg`;
@@ -179,6 +157,7 @@ router.post('/:spotId/upload', authMiddleware, upload.single('photo'), async (re
       success: true,
       message: '📸 Photo uploaded! Pending community review.',
       photo: { id: photoId, filename, status: 'pending', distance_metres: distanceMetres },
+      rules_summary: validation.checks,
     });
   } catch (err) {
     console.error('Upload error:', err);
