@@ -53,7 +53,7 @@ router.get('/', optionalAuth, (req, res) => {
   }
 });
 
-// GET /api/spots/trending - Trending spots by total views
+// GET /api/spots/trending
 router.get('/trending', optionalAuth, (req, res) => {
   try {
     const { country, limit = 10 } = req.query;
@@ -93,7 +93,7 @@ router.get('/trending', optionalAuth, (req, res) => {
   }
 });
 
-// GET /api/spots/nearby - Spots near user location
+// GET /api/spots/nearby
 router.get('/nearby', optionalAuth, (req, res) => {
   try {
     const { lat, lon, radius_km = 50, limit = 30 } = req.query;
@@ -109,7 +109,6 @@ router.get('/nearby', optionalAuth, (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid coordinates or radius' });
     }
 
-    // Get all approved spots then filter by distance
     const allSpots = db.prepare(`
       SELECT s.*,
         COUNT(sv.id) as view_count,
@@ -122,7 +121,6 @@ router.get('/nearby', optionalAuth, (req, res) => {
       GROUP BY s.id
     `).all();
 
-    // Filter by distance using Haversine
     function getDistance(lat1, lon1, lat2, lon2) {
       const R = 6371;
       const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -158,7 +156,7 @@ router.get('/categories', (req, res) => {
   res.json({ success: true, categories: categories.map(c => c.category) });
 });
 
-// GET /api/spots/pending-spots - Get user submitted spots pending approval
+// GET /api/spots/pending-spots
 router.get('/pending-spots', optionalAuth, (req, res) => {
   try {
     let spots = db.prepare(`
@@ -185,8 +183,8 @@ router.get('/pending-spots', optionalAuth, (req, res) => {
   }
 });
 
-// GET /api/spots/:id
-router.get('/:id', optionalAuth, (req, res) => {
+// GET /api/spots/:id — async so we can await image search
+router.get('/:id', optionalAuth, async (req, res) => {
   try {
     const spot = db.prepare('SELECT * FROM spots WHERE id = ?').get(req.params.id);
     if (!spot) return res.status(404).json({ success: false, message: 'Spot not found' });
@@ -195,6 +193,29 @@ router.get('/:id', optionalAuth, (req, res) => {
     const viewerId = req.user?.id || null;
     db.prepare('INSERT INTO spot_views (id, spot_id, user_id) VALUES (?, ?, ?)')
       .run(uuidv4(), spot.id, viewerId);
+
+    // On-demand image — await so it's ready before response
+    let existingPhoto = db.prepare(
+      'SELECT id, filename FROM photos WHERE spot_id = ? AND status = ? LIMIT 1'
+    ).get(spot.id, 'approved');
+
+    if (!existingPhoto) {
+      try {
+        const { searchWikimediaImage, fallbackImages } = require('../imageService');
+        const imageUrl = await searchWikimediaImage(spot.name);
+        const url = imageUrl || fallbackImages[spot.category] || fallbackImages['General'];
+        if (url) {
+          db.prepare(`
+            INSERT OR IGNORE INTO photos (id, spot_id, user_id, filename, status, uploaded_at)
+            VALUES (?, ?, NULL, ?, 'approved', ?)
+          `).run(uuidv4(), spot.id, url, Date.now());
+          existingPhoto = { filename: url };
+          console.log(`🖼️ Image stored for: ${spot.name} → ${url}`);
+        }
+      } catch(e) {
+        console.log('Image search error:', e.message);
+      }
+    }
 
     let isFavorite = false;
     let hasVotedRemote = false;
@@ -245,6 +266,7 @@ router.get('/:id', optionalAuth, (req, res) => {
       }
     });
   } catch (err) {
+    console.error('Spot fetch error:', err.message, err.stack);
     res.status(500).json({ success: false, message: 'Failed to fetch spot' });
   }
 });
@@ -266,7 +288,6 @@ router.post('/', authMiddleware, (req, res) => {
       city.trim(), country.trim(), parseFloat(latitude), parseFloat(longitude),
       address || '', req.user.id);
 
-    // Give submitter +5 points for submitting
     db.prepare('UPDATE users SET points = points + 5 WHERE id = ?').run(req.user.id);
 
     res.status(201).json({
@@ -280,7 +301,7 @@ router.post('/', authMiddleware, (req, res) => {
   }
 });
 
-// POST /api/spots/:id/vote-approval - Vote to approve a new spot
+// POST /api/spots/:id/vote-approval
 router.post('/:id/vote-approval', authMiddleware, (req, res) => {
   try {
     const spot = db.prepare('SELECT * FROM spots WHERE id = ?').get(req.params.id);
@@ -304,10 +325,8 @@ router.post('/:id/vote-approval', authMiddleware, (req, res) => {
     const newVotes = spot.approval_votes + 1;
     db.prepare('UPDATE spots SET approval_votes = ? WHERE id = ?').run(newVotes, spot.id);
 
-    // Auto approve when 5 votes reached
     if (newVotes >= 5) {
       db.prepare(`UPDATE spots SET status = 'approved' WHERE id = ?`).run(spot.id);
-      // Give submitter +20 points
       db.prepare('UPDATE users SET points = points + 20 WHERE id = ?').run(spot.submitted_by);
       return res.json({
         success: true,
