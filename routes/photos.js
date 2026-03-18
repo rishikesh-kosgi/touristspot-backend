@@ -8,6 +8,7 @@ const { v4: uuidv4 } = require('uuid');
 const { db, calculateDistance } = require('../database');
 const { authMiddleware } = require('../middleware/auth');
 const { validateImageForSpot } = require('../services/imageValidation');
+const { ensureLocalSpotImage } = require('../imageService');
 
 const MAX_PHOTOS = 10;
 const COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -28,18 +29,50 @@ const upload = multer({
   },
 });
 
+const APPROVED_USER_PHOTO_FILTER = `p.status = 'approved' AND p.user_id IS NOT NULL AND p.user_id != 'system'`;
+
 // GET /api/photos/:spotId - Get approved photos (latest 10)
-router.get('/:spotId', (req, res) => {
+router.get('/:spotId', async (req, res) => {
   try {
-    const photos = db.prepare(`
+    const spot = db.prepare('SELECT id, name, category, city, country, image_url FROM spots WHERE id = ?').get(req.params.spotId);
+    if (!spot) {
+      return res.status(404).json({ success: false, message: 'Spot not found' });
+    }
+
+    let photos = db.prepare(`
       SELECT p.id, p.filename, p.uploaded_at, p.flag_count,
              p.distance_metres, u.name as uploader_name
       FROM photos p
       LEFT JOIN users u ON p.user_id = u.id
-      WHERE p.spot_id = ? AND p.status = 'approved'
+      WHERE p.spot_id = ? AND ${APPROVED_USER_PHOTO_FILTER}
       ORDER BY p.uploaded_at DESC
       LIMIT 10
     `).all(req.params.spotId);
+
+    if (photos.length === 0) {
+      let sampleImageUrl = spot.image_url || null;
+      if (!sampleImageUrl) {
+        try {
+          sampleImageUrl = await ensureLocalSpotImage(spot);
+          db.prepare('UPDATE spots SET image_url = ? WHERE id = ?').run(sampleImageUrl, spot.id);
+        } catch (error) {
+          console.log(`Sample photo sync failed for ${spot.name}: ${error.message}`);
+        }
+      }
+
+      if (sampleImageUrl) {
+        photos = [{
+          id: `sample-${spot.id}`,
+          filename: sampleImageUrl,
+          uploaded_at: Date.now(),
+          flag_count: 0,
+          distance_metres: null,
+          uploader_name: 'Sample',
+          is_sample: true,
+        }];
+      }
+    }
+
     res.json({ success: true, photos });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Failed to fetch photos' });

@@ -3,6 +3,23 @@ const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const { db } = require('../database');
 const { authMiddleware, optionalAuth } = require('../middleware/auth');
+const { ensureLocalSpotImage } = require('../imageService');
+
+const APPROVED_USER_PHOTO_FILTER = `status = 'approved' AND user_id IS NOT NULL AND user_id != 'system'`;
+
+function attachFavorites(spots, userId) {
+  if (!userId) return spots;
+  const favorites = db.prepare('SELECT spot_id FROM favorites WHERE user_id = ?').all(userId);
+  const favSet = new Set(favorites.map(f => f.spot_id));
+  return spots.map(spot => ({ ...spot, is_favorite: favSet.has(spot.id) }));
+}
+
+async function ensureSampleImageForSpot(spot) {
+  if (spot.image_url) return spot.image_url;
+  const filename = await ensureLocalSpotImage(spot);
+  db.prepare('UPDATE spots SET image_url = ? WHERE id = ?').run(filename, spot.id);
+  return filename;
+}
 
 // GET /api/spots - Browse all spots
 router.get('/', optionalAuth, (req, res) => {
@@ -12,8 +29,9 @@ router.get('/', optionalAuth, (req, res) => {
 
     let query = `
       SELECT s.*,
-        (SELECT COUNT(*) FROM photos WHERE spot_id = s.id AND status = 'approved') as photo_count
-      FROM spots s WHERE s.status = 'approved'
+        (SELECT COUNT(*) FROM photos WHERE spot_id = s.id AND ${APPROVED_USER_PHOTO_FILTER}) as photo_count
+      FROM spots s
+      WHERE s.status = 'approved'
     `;
     const params = [];
 
@@ -22,30 +40,24 @@ router.get('/', optionalAuth, (req, res) => {
       const term = `%${search}%`;
       params.push(term, term, term, term);
     }
-    if (category) { query += ` AND s.category = ?`; params.push(category); }
-    if (city) { query += ` AND s.city LIKE ?`; params.push(`%${city}%`); }
-    if (country) { query += ` AND s.country LIKE ?`; params.push(`%${country}%`); }
+    if (category) {
+      query += ` AND s.category = ?`;
+      params.push(category);
+    }
+    if (city) {
+      query += ` AND s.city LIKE ?`;
+      params.push(`%${city}%`);
+    }
+    if (country) {
+      query += ` AND s.country LIKE ?`;
+      params.push(`%${country}%`);
+    }
 
     query += ` ORDER BY s.name ASC LIMIT ? OFFSET ?`;
     params.push(parseInt(limit), offset);
 
     let spots = db.prepare(query).all(...params);
-
-    if (req.user) {
-      const favorites = db.prepare('SELECT spot_id FROM favorites WHERE user_id = ?').all(req.user.id);
-      const favSet = new Set(favorites.map(f => f.spot_id));
-      spots = spots.map(s => ({ ...s, is_favorite: favSet.has(s.id) }));
-    }
-
-    spots = spots.map(spot => {
-      const cover = db.prepare(`
-        SELECT filename FROM photos
-        WHERE spot_id = ? AND status = 'approved'
-        ORDER BY uploaded_at DESC LIMIT 1
-      `).get(spot.id);
-      return { ...spot, cover_photo: cover ? cover.filename : null };
-    });
-
+    spots = attachFavorites(spots, req.user?.id);
     res.json({ success: true, spots });
   } catch (err) {
     console.error('Get spots error:', err);
@@ -61,9 +73,7 @@ router.get('/trending', optionalAuth, (req, res) => {
     let query = `
       SELECT s.*,
         COUNT(sv.id) as view_count,
-        (SELECT COUNT(*) FROM photos WHERE spot_id = s.id AND status = 'approved') as photo_count,
-        (SELECT filename FROM photos WHERE spot_id = s.id AND status = 'approved'
-         ORDER BY uploaded_at DESC LIMIT 1) as cover_photo
+        (SELECT COUNT(*) FROM photos WHERE spot_id = s.id AND ${APPROVED_USER_PHOTO_FILTER}) as photo_count
       FROM spots s
       LEFT JOIN spot_views sv ON sv.spot_id = s.id
       WHERE s.status = 'approved'
@@ -79,12 +89,7 @@ router.get('/trending', optionalAuth, (req, res) => {
     params.push(parseInt(limit));
 
     let spots = db.prepare(query).all(...params);
-
-    if (req.user) {
-      const favorites = db.prepare('SELECT spot_id FROM favorites WHERE user_id = ?').all(req.user.id);
-      const favSet = new Set(favorites.map(f => f.spot_id));
-      spots = spots.map(s => ({ ...s, is_favorite: favSet.has(s.id) }));
-    }
+    spots = attachFavorites(spots, req.user?.id);
 
     res.json({ success: true, spots });
   } catch (err) {
@@ -112,9 +117,7 @@ router.get('/nearby', optionalAuth, (req, res) => {
     const allSpots = db.prepare(`
       SELECT s.*,
         COUNT(sv.id) as view_count,
-        (SELECT COUNT(*) FROM photos WHERE spot_id = s.id AND status = 'approved') as photo_count,
-        (SELECT filename FROM photos WHERE spot_id = s.id AND status = 'approved'
-         ORDER BY uploaded_at DESC LIMIT 1) as cover_photo
+        (SELECT COUNT(*) FROM photos WHERE spot_id = s.id AND ${APPROVED_USER_PHOTO_FILTER}) as photo_count
       FROM spots s
       LEFT JOIN spot_views sv ON sv.spot_id = s.id
       WHERE s.status = 'approved'
@@ -125,24 +128,19 @@ router.get('/nearby', optionalAuth, (req, res) => {
       const R = 6371;
       const dLat = (lat2 - lat1) * Math.PI / 180;
       const dLon = (lon2 - lon1) * Math.PI / 180;
-      const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+      const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
         Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-        Math.sin(dLon/2) * Math.sin(dLon/2);
-      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     }
 
     let nearby = allSpots
-      .map(s => ({ ...s, distance_km: getDistance(userLat, userLon, s.latitude, s.longitude) }))
-      .filter(s => s.distance_km <= radiusKm)
+      .map(spot => ({ ...spot, distance_km: getDistance(userLat, userLon, spot.latitude, spot.longitude) }))
+      .filter(spot => spot.distance_km <= radiusKm)
       .sort((a, b) => a.distance_km - b.distance_km || b.view_count - a.view_count)
       .slice(0, parseInt(limit));
 
-    if (req.user) {
-      const favorites = db.prepare('SELECT spot_id FROM favorites WHERE user_id = ?').all(req.user.id);
-      const favSet = new Set(favorites.map(f => f.spot_id));
-      nearby = nearby.map(s => ({ ...s, is_favorite: favSet.has(s.id) }));
-    }
-
+    nearby = attachFavorites(nearby, req.user?.id);
     res.json({ success: true, spots: nearby });
   } catch (err) {
     console.error('Nearby error:', err);
@@ -170,10 +168,10 @@ router.get('/pending-spots', optionalAuth, (req, res) => {
     `).all();
 
     if (req.user) {
-      spots = spots.map(s => {
+      spots = spots.map(spot => {
         const voted = db.prepare('SELECT id FROM spot_approval_votes WHERE spot_id = ? AND user_id = ?')
-          .get(s.id, req.user.id);
-        return { ...s, has_voted: !!voted };
+          .get(spot.id, req.user.id);
+        return { ...spot, has_voted: !!voted };
       });
     }
 
@@ -183,37 +181,31 @@ router.get('/pending-spots', optionalAuth, (req, res) => {
   }
 });
 
-// GET /api/spots/:id — async so we can await image search
+// GET /api/spots/:id
 router.get('/:id', optionalAuth, async (req, res) => {
   try {
     const spot = db.prepare('SELECT * FROM spots WHERE id = ?').get(req.params.id);
-    if (!spot) return res.status(404).json({ success: false, message: 'Spot not found' });
+    if (!spot) {
+      return res.status(404).json({ success: false, message: 'Spot not found' });
+    }
 
-    // Track view
     const viewerId = req.user?.id || null;
     db.prepare('INSERT INTO spot_views (id, spot_id, user_id) VALUES (?, ?, ?)')
       .run(uuidv4(), spot.id, viewerId);
 
-    // On-demand image — await so it's ready before response
-    let existingPhoto = db.prepare(
-      'SELECT id, filename FROM photos WHERE spot_id = ? AND status = ? LIMIT 1'
-    ).get(spot.id, 'approved');
+    const latestUserPhoto = db.prepare(`
+      SELECT id, filename, uploaded_at
+      FROM photos
+      WHERE spot_id = ? AND ${APPROVED_USER_PHOTO_FILTER}
+      ORDER BY uploaded_at DESC LIMIT 1
+    `).get(spot.id);
 
-    if (!existingPhoto) {
+    let sampleImageUrl = spot.image_url || null;
+    if (!latestUserPhoto) {
       try {
-        const { searchWikimediaImage, fallbackImages } = require('../imageService');
-        const imageUrl = await searchWikimediaImage(spot.name);
-        const url = imageUrl || fallbackImages[spot.category] || fallbackImages['General'];
-        if (url) {
-          db.prepare(`
-            INSERT OR IGNORE INTO photos (id, spot_id, user_id, filename, status, uploaded_at)
-            VALUES (?, ?, NULL, ?, 'approved', ?)
-          `).run(uuidv4(), spot.id, url, Date.now());
-          existingPhoto = { filename: url };
-          console.log(`🖼️ Image stored for: ${spot.name} → ${url}`);
-        }
-      } catch(e) {
-        console.log('Image search error:', e.message);
+        sampleImageUrl = await ensureSampleImageForSpot(spot);
+      } catch (error) {
+        console.error(`Sample image generation failed for ${spot.name}:`, error.message);
       }
     }
 
@@ -229,7 +221,7 @@ router.get('/:id', optionalAuth, async (req, res) => {
     }
 
     const photoCount = db.prepare(`
-      SELECT COUNT(*) as c FROM photos WHERE spot_id = ? AND status = 'approved'
+      SELECT COUNT(*) as c FROM photos WHERE spot_id = ? AND ${APPROVED_USER_PHOTO_FILTER}
     `).get(spot.id);
 
     const weekViews = db.prepare(`
@@ -241,7 +233,7 @@ router.get('/:id', optionalAuth, async (req, res) => {
     if (photoCount.c >= 10) {
       const lastPhoto = db.prepare(`
         SELECT uploaded_at FROM photos
-        WHERE spot_id = ? AND status = 'approved'
+        WHERE spot_id = ? AND ${APPROVED_USER_PHOTO_FILTER}
         ORDER BY uploaded_at DESC LIMIT 1
       `).get(spot.id);
       if (lastPhoto) {
@@ -263,7 +255,8 @@ router.get('/:id', optionalAuth, async (req, res) => {
         photo_count: photoCount.c,
         week_views: weekViews.c,
         cooldown: cooldownInfo,
-      }
+        sample_image_url: sampleImageUrl,
+      },
     });
   } catch (err) {
     console.error('Spot fetch error:', err.message, err.stack);
@@ -284,15 +277,24 @@ router.post('/', authMiddleware, (req, res) => {
     db.prepare(`
       INSERT INTO spots (id, name, description, category, city, country, latitude, longitude, address, status, submitted_by)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?)
-    `).run(spotId, name.trim(), description || '', category || 'General',
-      city.trim(), country.trim(), parseFloat(latitude), parseFloat(longitude),
-      address || '', req.user.id);
+    `).run(
+      spotId,
+      name.trim(),
+      description || '',
+      category || 'General',
+      city.trim(),
+      country.trim(),
+      parseFloat(latitude),
+      parseFloat(longitude),
+      address || '',
+      req.user.id
+    );
 
     db.prepare('UPDATE users SET points = points + 5 WHERE id = ?').run(req.user.id);
 
     res.status(201).json({
       success: true,
-      message: '📍 Spot submitted! It will appear once 5 users approve it.',
+      message: 'Spot submitted! It will appear once 5 users approve it.',
       spot_id: spotId,
     });
   } catch (err) {
@@ -330,7 +332,7 @@ router.post('/:id/vote-approval', authMiddleware, (req, res) => {
       db.prepare('UPDATE users SET points = points + 20 WHERE id = ?').run(spot.submitted_by);
       return res.json({
         success: true,
-        message: '🎉 Spot approved and added to the list!',
+        message: 'Spot approved and added to the list!',
         approved: true,
         votes: newVotes,
       });
@@ -369,7 +371,7 @@ router.post('/:id/vote-remote', authMiddleware, (req, res) => {
 
     res.json({
       success: true,
-      message: newVotes >= 3 ? '✅ Spot marked as remote!' : `Vote recorded (${newVotes}/3)`,
+      message: newVotes >= 3 ? 'Spot marked as remote!' : `Vote recorded (${newVotes}/3)`,
       remote_votes: newVotes,
       is_remote: isRemote === 1,
     });

@@ -105,6 +105,7 @@ function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_photos_user_id ON photos(user_id);
     CREATE INDEX IF NOT EXISTS idx_favorites_user_id ON favorites(user_id);
     CREATE INDEX IF NOT EXISTS idx_spots_category ON spots(category);
+    CREATE INDEX IF NOT EXISTS idx_spots_status_name ON spots(status, name);
     CREATE INDEX IF NOT EXISTS idx_spot_views_spot_id ON spot_views(spot_id);
     CREATE INDEX IF NOT EXISTS idx_spot_views_viewed_at ON spot_views(viewed_at);
   `);
