@@ -1,17 +1,29 @@
 const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
-const { db } = require('../database');
+const { db, calculateDistance } = require('../database');
 const { authMiddleware, optionalAuth } = require('../middleware/auth');
 const { ensureLocalSpotImage } = require('../imageService');
+const { awardUniqueSpotPoint } = require('../services/points');
 
 const APPROVED_USER_PHOTO_FILTER = `status = 'approved' AND user_id IS NOT NULL AND user_id != 'system'`;
 
-function attachFavorites(spots, userId) {
+function attachUserState(spots, userId) {
   if (!userId) return spots;
   const favorites = db.prepare('SELECT spot_id FROM favorites WHERE user_id = ?').all(userId);
+  const visited = db.prepare('SELECT spot_id, last_visited_at, visit_count FROM visited_spots WHERE user_id = ?').all(userId);
   const favSet = new Set(favorites.map(f => f.spot_id));
-  return spots.map(spot => ({ ...spot, is_favorite: favSet.has(spot.id) }));
+  const visitedMap = new Map(visited.map(item => [item.spot_id, item]));
+  return spots.map(spot => {
+    const visit = visitedMap.get(spot.id);
+    return {
+      ...spot,
+      is_favorite: favSet.has(spot.id),
+      is_visited: !!visit,
+      visited_at: visit?.last_visited_at || null,
+      visit_count: visit?.visit_count || 0,
+    };
+  });
 }
 
 async function ensureSampleImageForSpot(spot) {
@@ -57,7 +69,7 @@ router.get('/', optionalAuth, (req, res) => {
     params.push(parseInt(limit), offset);
 
     let spots = db.prepare(query).all(...params);
-    spots = attachFavorites(spots, req.user?.id);
+    spots = attachUserState(spots, req.user?.id);
     res.json({ success: true, spots });
   } catch (err) {
     console.error('Get spots error:', err);
@@ -89,7 +101,7 @@ router.get('/trending', optionalAuth, (req, res) => {
     params.push(parseInt(limit));
 
     let spots = db.prepare(query).all(...params);
-    spots = attachFavorites(spots, req.user?.id);
+    spots = attachUserState(spots, req.user?.id);
 
     res.json({ success: true, spots });
   } catch (err) {
@@ -140,7 +152,7 @@ router.get('/nearby', optionalAuth, (req, res) => {
       .sort((a, b) => a.distance_km - b.distance_km || b.view_count - a.view_count)
       .slice(0, parseInt(limit));
 
-    nearby = attachFavorites(nearby, req.user?.id);
+    nearby = attachUserState(nearby, req.user?.id);
     res.json({ success: true, spots: nearby });
   } catch (err) {
     console.error('Nearby error:', err);
@@ -181,6 +193,25 @@ router.get('/pending-spots', optionalAuth, (req, res) => {
   }
 });
 
+// GET /api/spots/visited
+router.get('/visited', authMiddleware, (req, res) => {
+  try {
+    const spots = db.prepare(`
+      SELECT s.*, vs.first_visited_at, vs.last_visited_at, vs.visit_count,
+        (SELECT COUNT(*) FROM photos WHERE spot_id = s.id AND ${APPROVED_USER_PHOTO_FILTER}) as photo_count
+      FROM visited_spots vs
+      JOIN spots s ON s.id = vs.spot_id
+      WHERE vs.user_id = ? AND s.status = 'approved'
+      ORDER BY vs.last_visited_at DESC
+    `).all(req.user.id);
+
+    res.json({ success: true, spots: attachUserState(spots, req.user.id) });
+  } catch (err) {
+    console.error('Visited spots error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch visited spots' });
+  }
+});
+
 // GET /api/spots/:id
 router.get('/:id', optionalAuth, async (req, res) => {
   try {
@@ -211,6 +242,7 @@ router.get('/:id', optionalAuth, async (req, res) => {
 
     let isFavorite = false;
     let hasVotedRemote = false;
+    let visitMeta = null;
     if (req.user) {
       const fav = db.prepare('SELECT id FROM favorites WHERE user_id = ? AND spot_id = ?')
         .get(req.user.id, spot.id);
@@ -218,6 +250,11 @@ router.get('/:id', optionalAuth, async (req, res) => {
       const vote = db.prepare('SELECT id FROM remote_votes WHERE user_id = ? AND spot_id = ?')
         .get(req.user.id, spot.id);
       hasVotedRemote = !!vote;
+      visitMeta = db.prepare(`
+        SELECT first_visited_at, last_visited_at, visit_count
+        FROM visited_spots
+        WHERE user_id = ? AND spot_id = ?
+      `).get(req.user.id, spot.id);
     }
 
     const photoCount = db.prepare(`
@@ -252,6 +289,9 @@ router.get('/:id', optionalAuth, async (req, res) => {
         ...spot,
         is_favorite: isFavorite,
         has_voted_remote: hasVotedRemote,
+        is_visited: !!visitMeta,
+        visited_at: visitMeta?.last_visited_at || null,
+        visit_count: visitMeta?.visit_count || 0,
         photo_count: photoCount.c,
         week_views: weekViews.c,
         cooldown: cooldownInfo,
@@ -261,6 +301,74 @@ router.get('/:id', optionalAuth, async (req, res) => {
   } catch (err) {
     console.error('Spot fetch error:', err.message, err.stack);
     res.status(500).json({ success: false, message: 'Failed to fetch spot' });
+  }
+});
+
+// POST /api/spots/:id/visit
+router.post('/:id/visit', authMiddleware, (req, res) => {
+  try {
+    const spot = db.prepare('SELECT id, name, latitude, longitude, status FROM spots WHERE id = ?').get(req.params.id);
+    if (!spot || spot.status !== 'approved') {
+      return res.status(404).json({ success: false, message: 'Spot not found' });
+    }
+
+    const latitude = Number(req.body?.latitude);
+    const longitude = Number(req.body?.longitude);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      return res.status(400).json({ success: false, message: 'Valid latitude and longitude are required' });
+    }
+
+    const distanceMetres = calculateDistance(latitude, longitude, spot.latitude, spot.longitude);
+    if (distanceMetres > 750) {
+      return res.status(400).json({
+        success: false,
+        message: 'You need to be closer to this spot to mark it visited',
+        distance_metres: Math.round(distanceMetres),
+      });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const existing = db.prepare(`
+      SELECT id, visit_count, first_visited_at
+      FROM visited_spots
+      WHERE user_id = ? AND spot_id = ?
+    `).get(req.user.id, spot.id);
+
+    let pointAward = { awarded: false };
+
+    if (existing) {
+      db.prepare(`
+        UPDATE visited_spots
+        SET last_visited_at = ?, visit_count = visit_count + 1
+        WHERE id = ?
+      `).run(now, existing.id);
+    } else {
+      db.prepare(`
+        INSERT INTO visited_spots (id, user_id, spot_id, first_visited_at, last_visited_at, visit_count)
+        VALUES (?, ?, ?, ?, ?, 1)
+      `).run(uuidv4(), req.user.id, spot.id, now, now);
+      pointAward = awardUniqueSpotPoint(req.user.id, spot.id, 'visit');
+    }
+
+    const visit = db.prepare(`
+      SELECT first_visited_at, last_visited_at, visit_count
+      FROM visited_spots
+      WHERE user_id = ? AND spot_id = ?
+    `).get(req.user.id, spot.id);
+
+    res.json({
+      success: true,
+      message: `Visited ${spot.name} recorded`,
+      visited: {
+        ...visit,
+        distance_metres: Math.round(distanceMetres),
+      },
+      points_awarded: pointAward.awarded ? 1 : 0,
+      total_points: pointAward.points,
+    });
+  } catch (err) {
+    console.error('Visit record error:', err);
+    res.status(500).json({ success: false, message: 'Failed to record visit' });
   }
 });
 
@@ -289,8 +397,6 @@ router.post('/', authMiddleware, (req, res) => {
       address || '',
       req.user.id
     );
-
-    db.prepare('UPDATE users SET points = points + 5 WHERE id = ?').run(req.user.id);
 
     res.status(201).json({
       success: true,
@@ -329,7 +435,6 @@ router.post('/:id/vote-approval', authMiddleware, (req, res) => {
 
     if (newVotes >= 5) {
       db.prepare(`UPDATE spots SET status = 'approved' WHERE id = ?`).run(spot.id);
-      db.prepare('UPDATE users SET points = points + 20 WHERE id = ?').run(spot.submitted_by);
       return res.json({
         success: true,
         message: 'Spot approved and added to the list!',

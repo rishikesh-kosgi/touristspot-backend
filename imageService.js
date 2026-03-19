@@ -3,12 +3,15 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
+const { validateImageForSpot } = require('./services/imageValidation');
 
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
+const inFlightDownloads = new Map();
+
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function isRemoteUrl(value) {
@@ -19,51 +22,127 @@ function getSpotImageFilename(spotId) {
   return `spot_img_${spotId}.jpg`;
 }
 
-// Search Wikimedia API for image URL by spot name
-async function searchWikimediaImage(spotName) {
+function hasUsableLocalFile(filename) {
+  if (!filename || isRemoteUrl(filename)) return false;
+  const filePath = path.join(UPLOADS_DIR, filename);
+  return fs.existsSync(filePath) && fs.statSync(filePath).size > 8000;
+}
+
+function getCategoryFallbackFilename(category) {
+  const safeCategory = String(category || 'General').toLowerCase();
+  return `category_fallback_${safeCategory}.jpg`;
+}
+
+function makeRequest(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const protocol = url.startsWith('https') ? https : http;
+    const request = protocol.get(url, options, resolve);
+    request.on('error', reject);
+    request.on('timeout', () => {
+      request.destroy();
+      reject(new Error('Timeout'));
+    });
+  });
+}
+
+async function readResponseBuffer(response, sourceUrl) {
+  if (response.statusCode === 301 || response.statusCode === 302) {
+    const redirectUrl = new URL(response.headers.location, sourceUrl).toString();
+    return downloadImageBuffer(redirectUrl);
+  }
+
+  if (response.statusCode !== 200) {
+    throw new Error(`HTTP ${response.statusCode}`);
+  }
+
+  const contentType = String(response.headers['content-type'] || '').toLowerCase();
+  if (!contentType.startsWith('image/')) {
+    throw new Error(`Invalid content-type: ${contentType || 'unknown'}`);
+  }
+
+  const chunks = [];
+  for await (const chunk of response) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+async function downloadImageBuffer(url) {
+  const response = await makeRequest(url, {
+    headers: {
+      'User-Agent': 'TouristSpotApp/1.0',
+      Accept: 'image/jpeg,image/png,image/webp,image/*',
+    },
+    timeout: 30000,
+  });
+  return readResponseBuffer(response, url);
+}
+
+async function saveProcessedImage(buffer, filename) {
+  const filePath = path.join(UPLOADS_DIR, filename);
+  await sharp(buffer)
+    .rotate()
+    .resize(1200, 900, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 88, progressive: true })
+    .toFile(filePath);
+
+  if (!hasUsableLocalFile(filename)) {
+    throw new Error('Saved sample image is too small');
+  }
+
+  return filename;
+}
+
+async function downloadAndValidateImage(url, filename) {
+  const buffer = await downloadImageBuffer(url);
+  const validation = await validateImageForSpot(buffer);
+  if (!validation.accepted) {
+    throw new Error(`Rejected sample image: ${validation.failedRule}`);
+  }
+
+  return saveProcessedImage(buffer, filename);
+}
+
+async function searchWikimediaImage(query) {
+  if (!query) return null;
+
   return new Promise((resolve) => {
-    const query = encodeURIComponent(spotName);
-    const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${query}`;
+    const encodedQuery = encodeURIComponent(query.replace(/ /g, '_'));
+    const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodedQuery}`;
 
     https.get(url, {
       headers: {
         'User-Agent': 'TouristSpotApp/1.0 (educational project)',
-        'Accept': 'application/json',
+        Accept: 'application/json',
       },
       timeout: 10000,
-    }, response => {
+    }, (response) => {
       let data = '';
-      response.on('data', chunk => data += chunk);
+      response.on('data', (chunk) => { data += chunk; });
       response.on('end', () => {
         try {
           const json = JSON.parse(data);
-          if (json.thumbnail && json.thumbnail.source) {
-            // Get higher resolution version
-            // const imgUrl = json.thumbnail.source.replace(/\/\d+px-/, '/800px-');
-            const imgUrl = json.thumbnail.source
-            .replace(/\/\d+px-/, '/800px-')
-             .replace(/ /g, '_');
-              resolve(imgUrl);
-          } else {
-            resolve(null);
+          if (json?.thumbnail?.source) {
+            resolve(json.thumbnail.source.replace(/\/\d+px-/, '/1200px-').replace(/ /g, '_'));
+            return;
           }
-        } catch (e) {
-          resolve(null);
+        } catch (error) {
+          // Ignore parse failures.
         }
+        resolve(null);
       });
     }).on('error', () => resolve(null))
       .on('timeout', () => resolve(null));
   });
 }
 
-// Fallback images by category
 const fallbackImages = {
-  'Temple': 'https://upload.wikimedia.org/wikipedia/commons/thumb/9/94/Golden_Temple%2C_Amritsar%2C_India_-_Aug_2019.jpg/800px-Golden_Temple%2C_Amritsar%2C_India_-_Aug_2019.jpg',
-  'Nature': 'https://upload.wikimedia.org/wikipedia/commons/thumb/8/8a/Athirappilly_Waterfalls.jpg/800px-Athirappilly_Waterfalls.jpg',
-  'Beach': 'https://upload.wikimedia.org/wikipedia/commons/thumb/a/a9/Calangute_beach_Goa.jpg/800px-Calangute_beach_Goa.jpg',
-  'Historical': 'https://upload.wikimedia.org/wikipedia/commons/thumb/1/1d/Taj_Mahal_%28Edited%29.jpeg/800px-Taj_Mahal_%28Edited%29.jpeg',
-  'Landmark': 'https://upload.wikimedia.org/wikipedia/commons/thumb/1/1d/Taj_Mahal_%28Edited%29.jpeg/800px-Taj_Mahal_%28Edited%29.jpeg',
-  'General': 'https://upload.wikimedia.org/wikipedia/commons/thumb/f/f1/Varanasi_Ghats.jpg/800px-Varanasi_Ghats.jpg',
+  Temple: 'https://upload.wikimedia.org/wikipedia/commons/thumb/9/94/Golden_Temple%2C_Amritsar%2C_India_-_Aug_2019.jpg/1200px-Golden_Temple%2C_Amritsar%2C_India_-_Aug_2019.jpg',
+  Nature: 'https://upload.wikimedia.org/wikipedia/commons/thumb/8/8a/Athirappilly_Waterfalls.jpg/1200px-Athirappilly_Waterfalls.jpg',
+  Beach: 'https://upload.wikimedia.org/wikipedia/commons/thumb/a/a9/Calangute_beach_Goa.jpg/1200px-Calangute_beach_Goa.jpg',
+  Historical: 'https://upload.wikimedia.org/wikipedia/commons/thumb/1/1d/Taj_Mahal_%28Edited%29.jpeg/1200px-Taj_Mahal_%28Edited%29.jpeg',
+  Landmark: 'https://upload.wikimedia.org/wikipedia/commons/thumb/1/1d/Taj_Mahal_%28Edited%29.jpeg/1200px-Taj_Mahal_%28Edited%29.jpeg',
+  General: 'https://upload.wikimedia.org/wikipedia/commons/thumb/f/f1/Varanasi_Ghats.jpg/1200px-Varanasi_Ghats.jpg',
 };
 
 const placeholderTheme = {
@@ -85,11 +164,11 @@ function escapeSvgText(value) {
 }
 
 async function createPlaceholderImage(spot, filename) {
-  const filePath = path.join(UPLOADS_DIR, filename);
-  if (fs.existsSync(filePath) && fs.statSync(filePath).size > 10000) {
+  if (hasUsableLocalFile(filename)) {
     return filename;
   }
 
+  const filePath = path.join(UPLOADS_DIR, filename);
   const theme = placeholderTheme[spot.category] || placeholderTheme.General;
   const title = escapeSvgText(spot.name);
   const subtitle = escapeSvgText(spot.city ? `${spot.city}, ${spot.country || ''}` : spot.category || 'Tourist spot');
@@ -119,108 +198,60 @@ async function createPlaceholderImage(spot, filename) {
   return filename;
 }
 
-// Download image from URL to local file
-function downloadImage(url, filename) {
-  return new Promise((resolve, reject) => {
-    const filePath = path.join(UPLOADS_DIR, filename);
-    if (fs.existsSync(filePath) && fs.statSync(filePath).size > 10000) {
-      return resolve(filename);
-    }
-    const protocol = url.startsWith('https') ? https : http;
-    const file = fs.createWriteStream(filePath);
-    const request = protocol.get(url, {
-      headers: {
-        'User-Agent': 'TouristSpotApp/1.0',
-        'Accept': 'image/jpeg,image/*',
-      },
-      timeout: 30000,
-    }, response => {
-      if (response.statusCode === 301 || response.statusCode === 302) {
-        file.close();
-        try { fs.unlinkSync(filePath); } catch(e) {}
-        const redirectUrl = new URL(response.headers.location, url).toString();
-        return downloadImage(redirectUrl, filename).then(resolve).catch(reject);
-      }
-      if (response.statusCode === 429) {
-        file.close();
-        try { fs.unlinkSync(filePath); } catch(e) {}
-        return reject(new Error('HTTP 429'));
-      }
-      if (response.statusCode !== 200) {
-        file.close();
-        try { fs.unlinkSync(filePath); } catch(e) {}
-        return reject(new Error(`HTTP ${response.statusCode}`));
-      }
-      const contentType = String(response.headers['content-type'] || '').toLowerCase();
-      if (!contentType.startsWith('image/')) {
-        file.close();
-        try { fs.unlinkSync(filePath); } catch(e) {}
-        response.resume();
-        return reject(new Error(`Invalid content-type: ${contentType || 'unknown'}`));
-      }
-      response.pipe(file);
-      file.on('finish', () => {
-        file.close();
-        const size = fs.statSync(filePath).size;
-        if (size < 5000) {
-          fs.unlinkSync(filePath);
-          return reject(new Error('File too small'));
-        }
-        resolve(filename);
-      });
-    });
-    request.on('error', err => {
-      try { fs.unlinkSync(filePath); } catch(e) {}
-      reject(err);
-    });
-    request.on('timeout', () => {
-      request.destroy();
-      try { fs.unlinkSync(filePath); } catch(e) {}
-      reject(new Error('Timeout'));
-    });
-  });
+async function ensureCategoryFallbackImage(category) {
+  const filename = getCategoryFallbackFilename(category);
+  if (hasUsableLocalFile(filename)) {
+    return filename;
+  }
+
+  const url = fallbackImages[category] || fallbackImages.General;
+  try {
+    await downloadAndValidateImage(url, filename);
+    return filename;
+  } catch (error) {
+    return null;
+  }
 }
 
-// Main function - search Wikimedia API then download
-async function downloadImageWithRetry(spotName, category, filename, retries = 2) {
-  const filePath = path.join(UPLOADS_DIR, filename);
-
-  // Already downloaded
-  if (fs.existsSync(filePath) && fs.statSync(filePath).size > 10000) {
+async function downloadImageWithRetry(spot, filename, retries = 2) {
+  if (hasUsableLocalFile(filename)) {
     return filename;
   }
 
-  // Try Wikipedia API first
-  for (let i = 0; i < retries; i++) {
-    try {
-      console.log(`🔍 Searching Wikipedia image for: ${spotName}`);
-      const imageUrl = await searchWikimediaImage(spotName);
+  const candidateQueries = [
+    spot.name,
+    [spot.name, spot.city].filter(Boolean).join(' '),
+    [spot.name, spot.country].filter(Boolean).join(' '),
+  ].filter(Boolean);
 
-      if (imageUrl) {
-        console.log(`📥 Downloading: ${imageUrl}`);
-        await downloadImage(imageUrl, filename);
-        console.log(`✅ Downloaded: ${spotName}`);
-        return filename;
-      }
-      break;
-    } catch (err) {
-      if (err.message.includes('429') && i < retries - 1) {
-        const wait = (i + 1) * 3000;
-        console.log(`⏳ Rate limited, waiting ${wait/1000}s...`);
-        await sleep(wait);
+  for (const query of candidateQueries) {
+    for (let attempt = 0; attempt < retries; attempt += 1) {
+      try {
+        const imageUrl = await searchWikimediaImage(query);
+        if (imageUrl) {
+          await downloadAndValidateImage(imageUrl, filename);
+          return filename;
+        }
+        break;
+      } catch (error) {
+        if (String(error.message || '').includes('429') && attempt < retries - 1) {
+          await sleep((attempt + 1) * 2500);
+        }
       }
     }
   }
 
-  // Try fallback category image
-  try {
-    const fallbackUrl = fallbackImages[category] || fallbackImages['General'];
-    console.log(`⚠️ Using fallback for: ${spotName}`);
-    await downloadImage(fallbackUrl, filename);
+  const categoryFallbackFilename = await ensureCategoryFallbackImage(spot.category);
+  if (categoryFallbackFilename) {
+    const sourcePath = path.join(UPLOADS_DIR, categoryFallbackFilename);
+    const targetPath = path.join(UPLOADS_DIR, filename);
+    if (!hasUsableLocalFile(filename)) {
+      fs.copyFileSync(sourcePath, targetPath);
+    }
     return filename;
-  } catch (e) {
-    throw new Error(`All attempts failed for ${spotName}`);
   }
+
+  return createPlaceholderImage(spot, filename);
 }
 
 async function ensureLocalSpotImage(spot) {
@@ -228,36 +259,35 @@ async function ensureLocalSpotImage(spot) {
     throw new Error('Spot id and name are required');
   }
 
+  if (spot.image_url && hasUsableLocalFile(spot.image_url)) {
+    return spot.image_url;
+  }
+
   const filename = getSpotImageFilename(spot.id);
-  try {
-    await downloadImageWithRetry(spot.name, spot.category, filename);
-    return filename;
-  } catch (error) {
-    const remoteImageUrl = await searchWikimediaImage(spot.name);
-    if (remoteImageUrl) {
-      return remoteImageUrl;
-    }
-
-    if (fallbackImages[spot.category]) {
-      return fallbackImages[spot.category];
-    }
-
-    await createPlaceholderImage(spot, filename);
+  if (hasUsableLocalFile(filename)) {
     return filename;
   }
+
+  const existingDownload = inFlightDownloads.get(filename);
+  if (existingDownload) {
+    return existingDownload;
+  }
+
+  const promise = downloadImageWithRetry(spot, filename)
+    .finally(() => {
+      inFlightDownloads.delete(filename);
+    });
+
+  inFlightDownloads.set(filename, promise);
+  return promise;
 }
 
-// Legacy function kept for compatibility
 function getImageUrl(spotName, category) {
-  return fallbackImages[category] || fallbackImages['General'];
+  return fallbackImages[category] || fallbackImages.General;
 }
 
-// module.exports = { getImageUrl, downloadImage, downloadImageWithRetry, fallbackImages };
 module.exports = {
   getImageUrl,
-  downloadImage,
-  downloadImageWithRetry,
-  searchWikimediaImage,
   fallbackImages,
   isRemoteUrl,
   getSpotImageFilename,

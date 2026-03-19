@@ -9,7 +9,11 @@ function authMiddleware(req, res, next) {
   const token = authHeader.split(' ')[1];
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = db.prepare('SELECT id, phone, name, is_admin, points FROM users WHERE id = ?').get(decoded.userId);
+    const user = db.prepare(`
+      SELECT id, phone, name, email, google_id, avatar_url, auth_provider, is_admin, points
+      FROM users
+      WHERE id = ?
+    `).get(decoded.userId);
     if (!user) return res.status(401).json({ success: false, message: 'User not found' });
     req.user = user;
     next();

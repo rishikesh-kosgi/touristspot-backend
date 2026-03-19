@@ -1,5 +1,6 @@
 const Database = require('better-sqlite3');
 const path = require('path');
+const { seedSpots } = require('./seedSpotsData');
 
 const DB_PATH = path.join(__dirname, 'tourist_app.db');
 const db = new Database(DB_PATH);
@@ -13,6 +14,10 @@ function initializeDatabase() {
       id TEXT PRIMARY KEY,
       phone TEXT UNIQUE NOT NULL,
       name TEXT,
+      email TEXT,
+      google_id TEXT,
+      avatar_url TEXT,
+      auth_provider TEXT DEFAULT 'phone',
       is_admin INTEGER DEFAULT 0,
       points INTEGER DEFAULT 0,
       otp TEXT,
@@ -101,80 +106,151 @@ function initializeDatabase() {
       FOREIGN KEY (spot_id) REFERENCES spots(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS trip_groups (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      invite_code TEXT UNIQUE NOT NULL,
+      created_by TEXT NOT NULL,
+      created_at INTEGER DEFAULT (strftime('%s', 'now')),
+      FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS trip_group_members (
+      id TEXT PRIMARY KEY,
+      group_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      role TEXT DEFAULT 'member',
+      joined_at INTEGER DEFAULT (strftime('%s', 'now')),
+      UNIQUE(group_id, user_id),
+      FOREIGN KEY (group_id) REFERENCES trip_groups(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS trip_group_spot_suggestions (
+      id TEXT PRIMARY KEY,
+      group_id TEXT NOT NULL,
+      spot_id TEXT NOT NULL,
+      suggested_by TEXT NOT NULL,
+      created_at INTEGER DEFAULT (strftime('%s', 'now')),
+      UNIQUE(group_id, spot_id),
+      FOREIGN KEY (group_id) REFERENCES trip_groups(id) ON DELETE CASCADE,
+      FOREIGN KEY (spot_id) REFERENCES spots(id) ON DELETE CASCADE,
+      FOREIGN KEY (suggested_by) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS trip_group_spot_votes (
+      id TEXT PRIMARY KEY,
+      suggestion_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      vote TEXT NOT NULL,
+      created_at INTEGER DEFAULT (strftime('%s', 'now')),
+      UNIQUE(suggestion_id, user_id),
+      FOREIGN KEY (suggestion_id) REFERENCES trip_group_spot_suggestions(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS point_events (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      spot_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      points INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER DEFAULT (strftime('%s', 'now')),
+      UNIQUE(user_id, spot_id, event_type),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (spot_id) REFERENCES spots(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS visited_spots (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      spot_id TEXT NOT NULL,
+      first_visited_at INTEGER DEFAULT (strftime('%s', 'now')),
+      last_visited_at INTEGER DEFAULT (strftime('%s', 'now')),
+      visit_count INTEGER DEFAULT 1,
+      UNIQUE(user_id, spot_id),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (spot_id) REFERENCES spots(id) ON DELETE CASCADE
+    );
+
     CREATE INDEX IF NOT EXISTS idx_photos_spot_id ON photos(spot_id);
     CREATE INDEX IF NOT EXISTS idx_photos_user_id ON photos(user_id);
     CREATE INDEX IF NOT EXISTS idx_favorites_user_id ON favorites(user_id);
+    CREATE INDEX IF NOT EXISTS idx_trip_group_members_user_id ON trip_group_members(user_id);
+    CREATE INDEX IF NOT EXISTS idx_trip_group_members_group_id ON trip_group_members(group_id);
+    CREATE INDEX IF NOT EXISTS idx_trip_group_suggestions_group_id ON trip_group_spot_suggestions(group_id);
+    CREATE INDEX IF NOT EXISTS idx_trip_group_votes_suggestion_id ON trip_group_spot_votes(suggestion_id);
+    CREATE INDEX IF NOT EXISTS idx_point_events_user_id ON point_events(user_id);
+    CREATE INDEX IF NOT EXISTS idx_point_events_spot_event ON point_events(spot_id, event_type);
+    CREATE INDEX IF NOT EXISTS idx_visited_spots_user_id ON visited_spots(user_id);
+    CREATE INDEX IF NOT EXISTS idx_visited_spots_spot_id ON visited_spots(spot_id);
     CREATE INDEX IF NOT EXISTS idx_spots_category ON spots(category);
     CREATE INDEX IF NOT EXISTS idx_spots_status_name ON spots(status, name);
     CREATE INDEX IF NOT EXISTS idx_spot_views_spot_id ON spot_views(spot_id);
     CREATE INDEX IF NOT EXISTS idx_spot_views_viewed_at ON spot_views(viewed_at);
   `);
 
-  // Add image_url column if it doesn't exist (for existing databases)
   try {
-    db.exec(`ALTER TABLE spots ADD COLUMN image_url TEXT`);
-    console.log('✅ Added image_url column to spots');
-  } catch(e) {
-    // Column already exists, ignore
+    db.exec('ALTER TABLE spots ADD COLUMN image_url TEXT');
+    console.log('Added image_url column to spots');
+  } catch (error) {
+    // Column already exists.
   }
 
-  seedSpots();
-  console.log('✅ Database initialized');
+  const userColumns = [
+    ['email', 'TEXT'],
+    ['google_id', 'TEXT'],
+    ['avatar_url', 'TEXT'],
+    ['auth_provider', "TEXT DEFAULT 'phone'"],
+  ];
+
+  for (const [column, type] of userColumns) {
+    try {
+      db.exec(`ALTER TABLE users ADD COLUMN ${column} ${type}`);
+      console.log(`Added ${column} column to users`);
+    } catch (error) {
+      // Column already exists.
+    }
+  }
+
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique
+    ON users(email)
+    WHERE email IS NOT NULL;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_id_unique
+    ON users(google_id)
+    WHERE google_id IS NOT NULL;
+  `);
+
+  syncSeedSpots();
+  db.exec(`
+    UPDATE users
+    SET points = COALESCE((
+      SELECT SUM(pe.points)
+      FROM point_events pe
+      WHERE pe.user_id = users.id
+    ), 0)
+  `);
+  console.log('Database initialized');
 }
 
-function seedSpots() {
-  const count = db.prepare('SELECT COUNT(*) as c FROM spots').get();
-  if (count.c > 0) return;
-
+function syncSeedSpots() {
   const insert = db.prepare(`
     INSERT INTO spots (id, name, description, category, city, country, latitude, longitude, address, is_remote)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-
-  const spots = [
-    ['spot_1', 'Eiffel Tower', 'Iconic iron lattice tower in Paris.', 'Landmark', 'Paris', 'France', 48.8584, 2.2945, 'Champ de Mars, Paris', 0],
-    ['spot_2', 'Colosseum', 'Ancient amphitheater in Rome.', 'Historical', 'Rome', 'Italy', 41.8902, 12.4922, 'Piazza del Colosseo, Rome', 0],
-    ['spot_3', 'Rohtang Pass', 'High mountain pass near Manali with heavy snowfall.', 'Nature', 'Manali', 'India', 32.3726, 77.2375, 'Rohtang Pass, Himachal Pradesh', 1],
-    ['spot_4', 'Solang Valley', 'Snow valley near Manali known for skiing.', 'Nature', 'Manali', 'India', 32.3195, 77.1518, 'Solang Valley, Himachal Pradesh', 1],
-    ['spot_5', 'Athirappilly Falls', 'Largest waterfall in Kerala, India.', 'Nature', 'Thrissur', 'India', 10.2867, 76.5694, 'Athirappilly, Kerala', 0],
-    ['spot_6', 'Dudhsagar Falls', 'Four-tiered waterfall on Goa-Karnataka border.', 'Nature', 'Goa', 'India', 15.3147, 74.3144, 'Dudhsagar, Goa', 1],
-    ['spot_7', 'Taj Mahal', 'Ivory-white marble mausoleum in Agra.', 'Landmark', 'Agra', 'India', 27.1751, 78.0421, 'Dharmapuri, Agra', 0],
-    ['spot_8', 'Spiti Valley', 'Cold desert mountain valley in Himachal Pradesh.', 'Nature', 'Spiti', 'India', 32.2432, 78.0358, 'Spiti Valley, Himachal Pradesh', 1],
-    ['spot_9', 'Pangong Lake', 'High altitude lake in Ladakh.', 'Nature', 'Ladakh', 'India', 33.7640, 78.6796, 'Pangong Tso, Ladakh', 1],
-    ['spot_10', 'Niagara Falls', 'Large waterfalls on Canada-USA border.', 'Nature', 'Niagara Falls', 'Canada', 43.0962, -79.0377, 'Niagara Falls, Ontario', 0],
-    ['spot_11', 'Mysore Palace', 'Magnificent royal palace and major tourist attraction in Mysore.', 'Landmark', 'Mysuru', 'India', 12.3052, 76.6552, 'Sayyaji Rao Rd, Mysuru, Karnataka', 0],
-    ['spot_12', 'Coorg Coffee Estates', 'Lush green coffee plantations in the hills of Coorg.', 'Nature', 'Coorg', 'India', 12.3375, 75.8069, 'Madikeri, Coorg, Karnataka', 0],
-    ['spot_13', 'Jog Falls', 'Second highest plunge waterfall in India.', 'Nature', 'Shimoga', 'India', 14.2269, 74.7921, 'Jog Falls, Shimoga, Karnataka', 0],
-    ['spot_14', 'Netravati Peak', 'Stunning trekking peak in the Western Ghats of Karnataka.', 'Nature', 'Mangalore', 'India', 12.9762, 75.3998, 'Netravati Peak, Karnataka', 1],
-    ['spot_15', 'Hampi', 'UNESCO World Heritage Site with ancient Vijayanagara ruins.', 'Historical', 'Hampi', 'India', 15.3350, 76.4600, 'Hampi, Ballari District, Karnataka', 0],
-    ['spot_16', 'Badami Caves', 'Ancient rock-cut cave temples carved in 6th century.', 'Historical', 'Badami', 'India', 15.9149, 75.6760, 'Badami, Bagalkot, Karnataka', 0],
-    ['spot_17', 'Shivanasamudra Falls', 'Twin waterfalls on the Kaveri river in Karnataka.', 'Nature', 'Mandya', 'India', 12.2700, 77.1600, 'Shivanasamudra, Mandya, Karnataka', 0],
-    ['spot_18', 'Varkala Beach', 'Stunning cliffside beach with mineral springs in Kerala.', 'Beach', 'Varkala', 'India', 8.7379, 76.7163, 'Varkala, Thiruvananthapuram, Kerala', 0],
-    ['spot_19', 'Kovalam Beach', 'Famous crescent shaped beach near Thiruvananthapuram.', 'Beach', 'Kovalam', 'India', 8.4004, 76.9787, 'Kovalam, Thiruvananthapuram, Kerala', 0],
-    ['spot_20', 'Munnar Tea Gardens', 'Rolling hills covered with lush green tea plantations.', 'Nature', 'Munnar', 'India', 10.0889, 77.0595, 'Munnar, Idukki, Kerala', 0],
-    ['spot_21', 'Alleppey Backwaters', 'Venice of the East - famous houseboat rides through backwaters.', 'Nature', 'Alappuzha', 'India', 9.4981, 76.3388, 'Alappuzha, Kerala', 0],
-    ['spot_22', 'Wayanad Wildlife Sanctuary', 'Dense forest sanctuary home to elephants and tigers.', 'Nature', 'Wayanad', 'India', 11.6854, 76.1320, 'Wayanad, Kerala', 1],
-    ['spot_23', 'Calangute Beach', 'Queen of beaches in North Goa, popular tourist destination.', 'Beach', 'Goa', 'India', 15.5440, 73.7528, 'Calangute, North Goa', 0],
-    ['spot_24', 'Palolem Beach', 'Crescent shaped peaceful beach in South Goa.', 'Beach', 'Goa', 'India', 15.0100, 74.0232, 'Palolem, South Goa', 0],
-    ['spot_25', 'Baga Beach', 'Famous beach known for nightlife and water sports.', 'Beach', 'Goa', 'India', 15.5569, 73.7520, 'Baga, North Goa', 0],
-    ['spot_26', 'Dudhsagar Beach', 'Remote beach accessible only by boat in South Goa.', 'Beach', 'Goa', 'India', 15.3147, 74.0134, 'Canacona, South Goa', 1],
-    ['spot_27', 'Charminar', 'Iconic 16th century mosque and monument in Hyderabad.', 'Historical', 'Hyderabad', 'India', 17.3616, 78.4747, 'Charminar, Hyderabad, Telangana', 0],
-    ['spot_28', 'Golconda Fort', 'Magnificent medieval fort and former diamond trading centre.', 'Historical', 'Hyderabad', 'India', 17.3833, 78.4011, 'Golconda, Hyderabad, Telangana', 0],
-    ['spot_29', 'Araku Valley', 'Scenic valley with coffee plantations and tribal culture.', 'Nature', 'Visakhapatnam', 'India', 18.3273, 82.8757, 'Araku Valley, Andhra Pradesh', 1],
-    ['spot_30', 'Hawa Mahal', 'Palace of Winds - iconic pink sandstone palace in Jaipur.', 'Landmark', 'Jaipur', 'India', 26.9239, 75.8267, 'Hawa Mahal Rd, Jaipur, Rajasthan', 0],
-    ['spot_31', 'Jaisalmer Fort', 'Living fort rising from the Thar Desert in golden sandstone.', 'Historical', 'Jaisalmer', 'India', 26.9157, 70.9083, 'Jaisalmer, Rajasthan', 0],
-    ['spot_32', 'Pushkar Lake', 'Sacred lake surrounded by 52 ghats and Hindu temples.', 'Historical', 'Pushkar', 'India', 26.4897, 74.5511, 'Pushkar, Ajmer, Rajasthan', 0],
-    ['spot_33', 'Kedarnath Temple', 'Ancient Hindu temple in the Himalayas at 3583m altitude.', 'Temple', 'Rudraprayag', 'India', 30.7346, 79.0669, 'Kedarnath, Uttarakhand', 1],
-    ['spot_34', 'Valley of Flowers', 'UNESCO World Heritage alpine valley with stunning wildflowers.', 'Nature', 'Chamoli', 'India', 30.7283, 79.6050, 'Valley of Flowers, Uttarakhand', 1],
-    ['spot_35', 'Nainital Lake', 'Beautiful pear shaped lake surrounded by hills in Uttarakhand.', 'Nature', 'Nainital', 'India', 29.3919, 79.4542, 'Nainital, Uttarakhand', 0],
-    ['spot_36', 'Sanjeevini Circle Test Spot', 'Test location for photo validation - Lokanayakanagar, Mysore.', 'General', 'Mysuru', 'India', 12.350731, 76.627249, '9th Cross, Lokanayakanagar, Sanjeevini Circle, Mysuru 570016', 0],
-  ];
+  const existingSpot = db.prepare('SELECT id FROM spots WHERE id = ?');
 
   const insertAll = db.transaction(() => {
-    for (const spot of spots) insert.run(...spot);
+    for (const spot of seedSpots) {
+      if (!existingSpot.get(spot[0])) {
+        insert.run(...spot);
+      }
+    }
   });
+
   insertAll();
-  console.log('✅ Sample spots seeded');
 }
 
 function calculateDistance(lat1, lon1, lat2, lon2) {

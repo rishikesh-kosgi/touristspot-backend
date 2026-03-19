@@ -9,6 +9,7 @@ const { db, calculateDistance } = require('../database');
 const { authMiddleware } = require('../middleware/auth');
 const { validateImageForSpot } = require('../services/imageValidation');
 const { ensureLocalSpotImage } = require('../imageService');
+const { awardUniqueSpotPoint } = require('../services/points');
 
 const MAX_PHOTOS = 10;
 const COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -185,12 +186,15 @@ router.post('/:spotId/upload', authMiddleware, upload.single('photo'), async (re
       INSERT INTO photos (id, spot_id, user_id, filename, status, user_latitude, user_longitude, distance_metres, uploaded_at)
       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)
     `).run(photoId, spotId, userId, filename, userLat, userLon, distanceMetres, Date.now());
+    const pointAward = awardUniqueSpotPoint(userId, spotId, 'upload');
 
     res.status(201).json({
       success: true,
       message: '📸 Photo uploaded! Pending community review.',
       photo: { id: photoId, filename, status: 'pending', distance_metres: distanceMetres },
       rules_summary: validation.checks,
+      points_awarded: pointAward.awarded ? 1 : 0,
+      total_points: pointAward.points,
     });
   } catch (err) {
     console.error('Upload error:', err);
@@ -213,9 +217,6 @@ router.post('/:photoId/approve', authMiddleware, (req, res) => {
     db.prepare(`UPDATE photos SET status = 'approved', uploaded_at = ? WHERE id = ?`)
       .run(Date.now(), photo.id);
 
-    // +10 points to uploader
-    db.prepare('UPDATE users SET points = points + 10 WHERE id = ?').run(photo.user_id);
-
     // Delete oldest if over limit
     const approved = db.prepare(`
       SELECT id, filename FROM photos
@@ -230,7 +231,7 @@ router.post('/:photoId/approve', authMiddleware, (req, res) => {
       db.prepare('DELETE FROM photos WHERE id = ?').run(oldest.id);
     }
 
-    res.json({ success: true, message: '✅ Photo approved! Uploader earned +10 points.' });
+    res.json({ success: true, message: '✅ Photo approved!' });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Approval failed' });
   }
@@ -265,9 +266,7 @@ router.post('/:photoId/flag', authMiddleware, (req, res) => {
       db.prepare(`UPDATE photos SET status = 'rejected' WHERE id = ?`).run(photo.id);
       const filePath = path.join(UPLOADS_DIR, photo.filename);
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-      // -5 points to uploader
-      db.prepare('UPDATE users SET points = MAX(0, points - 5) WHERE id = ?').run(photo.user_id);
-      return res.json({ success: true, message: '🚩 Photo removed. Uploader lost 5 points.' });
+      return res.json({ success: true, message: '🚩 Photo removed.' });
     }
 
     res.json({ success: true, message: '🚩 Photo flagged.', flags: newCount });
