@@ -1,9 +1,38 @@
 const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
 const { db } = require('../database');
 const { authMiddleware } = require('../middleware/auth');
+
+const authWriteLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many auth attempts. Please try again later.' },
+});
+
+function getJwtSecret() {
+  const secret = String(process.env.JWT_SECRET || '');
+  if (!secret) {
+    throw new Error('JWT secret is not configured');
+  }
+  return secret;
+}
+
+function issueAuthToken(userId) {
+  return jwt.sign(
+    { userId },
+    getJwtSecret(),
+    {
+      expiresIn: '30d',
+      issuer: 'touristspot-backend',
+      audience: 'touristspot-mobile',
+    }
+  );
+}
 
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
@@ -50,7 +79,7 @@ async function verifyGoogleIdToken(idToken) {
 }
 
 // POST /api/auth/send-otp
-router.post('/send-otp', async (req, res) => {
+router.post('/send-otp', authWriteLimiter, async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ success: false, message: 'Phone number required' });
@@ -81,7 +110,7 @@ router.post('/send-otp', async (req, res) => {
 });
 
 // POST /api/auth/verify-otp
-router.post('/verify-otp', (req, res) => {
+router.post('/verify-otp', authWriteLimiter, (req, res) => {
   try {
     const { phone, otp } = req.body;
     if (!phone || !otp) {
@@ -122,7 +151,7 @@ router.post('/verify-otp', (req, res) => {
 });
 
 // POST /api/auth/google
-router.post('/google', async (req, res) => {
+router.post('/google', authWriteLimiter, async (req, res) => {
   try {
     const { idToken } = req.body;
     if (!idToken) {
@@ -154,7 +183,7 @@ router.post('/google', async (req, res) => {
       user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
     }
 
-    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: '30d' });
+    const token = issueAuthToken(user.id);
     res.json({
       success: true,
       message: 'Google login successful',

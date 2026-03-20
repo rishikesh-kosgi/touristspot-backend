@@ -9,6 +9,14 @@ const UPLOADS_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
 const inFlightDownloads = new Map();
+const MAX_IMAGE_DOWNLOAD_BYTES = 10 * 1024 * 1024;
+const ALLOWED_REMOTE_HOSTS = new Set([
+  'en.wikipedia.org',
+  'wikipedia.org',
+  'upload.wikimedia.org',
+  'commons.wikimedia.org',
+  'wikimedia.org',
+]);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -16,6 +24,24 @@ function sleep(ms) {
 
 function isRemoteUrl(value) {
   return typeof value === 'string' && /^https?:\/\//i.test(value);
+}
+
+function assertAllowedRemoteUrl(value) {
+  const parsed = new URL(value);
+  const hostname = parsed.hostname.toLowerCase();
+  const isAllowedHost = [...ALLOWED_REMOTE_HOSTS].some(
+    allowedHost => hostname === allowedHost || hostname.endsWith(`.${allowedHost}`)
+  );
+
+  if (!isAllowedHost) {
+    throw new Error(`Remote host not allowed: ${hostname}`);
+  }
+
+  if (parsed.username || parsed.password) {
+    throw new Error('Authenticated URLs are not allowed');
+  }
+
+  return parsed;
 }
 
 function getSpotImageFilename(spotId) {
@@ -35,6 +61,7 @@ function getCategoryFallbackFilename(category) {
 
 function makeRequest(url, options = {}) {
   return new Promise((resolve, reject) => {
+    assertAllowedRemoteUrl(url);
     const protocol = url.startsWith('https') ? https : http;
     const request = protocol.get(url, options, resolve);
     request.on('error', reject);
@@ -45,10 +72,14 @@ function makeRequest(url, options = {}) {
   });
 }
 
-async function readResponseBuffer(response, sourceUrl) {
+async function readResponseBuffer(response, sourceUrl, redirectCount = 0) {
   if (response.statusCode === 301 || response.statusCode === 302) {
+    if (redirectCount >= 3) {
+      throw new Error('Too many redirects');
+    }
+
     const redirectUrl = new URL(response.headers.location, sourceUrl).toString();
-    return downloadImageBuffer(redirectUrl);
+    return downloadImageBuffer(redirectUrl, redirectCount + 1);
   }
 
   if (response.statusCode !== 200) {
@@ -60,14 +91,24 @@ async function readResponseBuffer(response, sourceUrl) {
     throw new Error(`Invalid content-type: ${contentType || 'unknown'}`);
   }
 
+  const contentLength = Number(response.headers['content-length']);
+  if (Number.isFinite(contentLength) && contentLength > MAX_IMAGE_DOWNLOAD_BYTES) {
+    throw new Error('Remote image exceeds size limit');
+  }
+
   const chunks = [];
+  let totalBytes = 0;
   for await (const chunk of response) {
+    totalBytes += chunk.length;
+    if (totalBytes > MAX_IMAGE_DOWNLOAD_BYTES) {
+      throw new Error('Remote image exceeds size limit');
+    }
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
 }
 
-async function downloadImageBuffer(url) {
+async function downloadImageBuffer(url, redirectCount = 0) {
   const response = await makeRequest(url, {
     headers: {
       'User-Agent': 'TouristSpotApp/1.0',
@@ -75,7 +116,7 @@ async function downloadImageBuffer(url) {
     },
     timeout: 30000,
   });
-  return readResponseBuffer(response, url);
+  return readResponseBuffer(response, url, redirectCount);
 }
 
 async function saveProcessedImage(buffer, filename) {
@@ -109,6 +150,7 @@ async function searchWikimediaImage(query) {
   return new Promise((resolve) => {
     const encodedQuery = encodeURIComponent(query.replace(/ /g, '_'));
     const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodedQuery}`;
+    assertAllowedRemoteUrl(url);
 
     https.get(url, {
       headers: {

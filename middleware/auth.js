@@ -1,6 +1,14 @@
 const jwt = require('jsonwebtoken');
 const { db } = require('../database');
 
+function getJwtSecret() {
+  const secret = String(process.env.JWT_SECRET || '');
+  if (!secret) {
+    throw new Error('JWT secret is not configured');
+  }
+  return secret;
+}
+
 function authMiddleware(req, res, next) {
   const authHeader = req.headers['authorization'];
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -8,7 +16,7 @@ function authMiddleware(req, res, next) {
   }
   const token = authHeader.split(' ')[1];
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, getJwtSecret());
     const user = db.prepare(`
       SELECT id, phone, name, email, google_id, avatar_url, auth_provider, is_admin, points
       FROM users

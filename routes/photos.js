@@ -198,7 +198,7 @@ router.post('/:spotId/upload', authMiddleware, upload.single('photo'), async (re
     });
   } catch (err) {
     console.error('Upload error:', err);
-    res.status(500).json({ success: false, message: err.message || 'Upload failed' });
+    res.status(500).json({ success: false, message: 'Upload failed' });
   }
 });
 
